@@ -16,7 +16,8 @@
  *   MP3  : estimated from file size + first frame bitrate (CBR approximation)
  *   FLAC : exact (total_samples / sample_rate from STREAMINFO)
  *   WAV  : exact (data chunk size / byte_rate from fmt)
- *   OGG  : left as 0; the decoder fills it on open (needs last-page granule)
+ *   OGG  : exact (last page's granule position / sample_rate, read from the
+ *          file tail; average bitrate derived from file size / duration)
  */
 #include "tag_reader.h"
 
@@ -111,6 +112,25 @@ static size_t read_tail(const wchar_t *path, uint8_t *dst, size_t n) {
     size_t got = fread(dst, 1, n, f);
     fclose(f);
     return got;
+}
+
+/* 读取文件末尾最多 max_bytes 字节（文件小于 max_bytes 时读整个文件），
+ * 调用者负责 free()。失败返回 NULL。 */
+static uint8_t *slurp_tail(const wchar_t *path, size_t max_bytes,
+                           size_t *out_size) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return NULL;
+    _fseeki64(f, 0, SEEK_END);
+    int64_t total = _ftelli64(f);
+    if (total <= 0) { fclose(f); return NULL; }
+    size_t n = ((uint64_t)total < max_bytes) ? (size_t)total : max_bytes;
+    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+    if (!buf) { fclose(f); return NULL; }
+    _fseeki64(f, -(int64_t)n, SEEK_END);
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    *out_size = got;
+    return buf;
 }
 
 /* ---- ID3v2 text frame decoding --------------------------------------- */
@@ -323,6 +343,23 @@ static int parse_mp3_first_frame(const uint8_t *buf, size_t buf_size,
     return 0;
 }
 
+/* 当 ID3v2 标签（通常因内嵌封面图）超过 TAG_HEADER_BUF 时，头部缓冲里
+ * 扫描不到真实帧同步。直接从文件 seek 到标签末尾读取帧头解析。
+ * I/O 有界：只读一小块（256 字节）。 */
+static void parse_mp3_frame_after_big_tag(const wchar_t *path, size_t id3_total,
+                                          int *bitrate_kbps, int *sample_rate_hz,
+                                          int *channels) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return;
+    if (_fseeki64(f, (__int64)id3_total, SEEK_SET) == 0) {
+        uint8_t fh[256];   /* 帧头 4 字节 + 足够余量 */
+        size_t n = fread(fh, 1, sizeof(fh), f);
+        if (n >= 4)
+            parse_mp3_first_frame(fh, n, bitrate_kbps, sample_rate_hz, channels);
+    }
+    fclose(f);
+}
+
 /* ---- Vorbis comment block parsing (shared by FLAC and OGG) ----------- */
 /* 解析 Vorbis Comment 数据块（FLAC 和 OGG 共用）。
  * `data` 指向"vorbis"魔数/供应商字段之后的位置，每条注释为 "KEY=VALUE" 格式的 UTF-8 文本。
@@ -413,7 +450,8 @@ static void parse_flac(const uint8_t *buf, size_t buf_size, TagInfo *out) {
 /* 解析 OGG Vorbis 文件：遍历 Ogg 页面，读取前两个包头数据包。
  * - 数据包 0（Identification）：提取声道数和采样率
  * - 数据包 1（Comment）：提取标签字段
- * 时长在此处不计算，交由解码器在打开音轨时填充。 */
+ * 时长和比特率在 tag_read() 中通过读取文件尾部的最后一页补齐
+ * （见 ogg_duration_from_tail）。 */
 static void parse_ogg(const uint8_t *buf, size_t buf_size, TagInfo *out) {
     size_t pos = 0;
     int packet_idx = 0;
@@ -445,7 +483,36 @@ static void parse_ogg(const uint8_t *buf, size_t buf_size, TagInfo *out) {
         packet_idx++;
         if (packet_idx >= 2) break;
     }
-    /* Duration left as 0 — the decoder fills it when the track is opened. */
+}
+
+/* 从文件尾部缓冲向前定位最后一个有效 Ogg 页面，读取其 granule position
+ * （页头偏移 6，64 位小端），得到 Ogg 流的总样本数，从而在 tag 阶段就算出
+ * 精确时长：duration = granule / sample_rate，并推算平均比特率 =
+ * file_size * 8 / duration。*/
+static void ogg_duration_from_tail(const uint8_t *buf, size_t n, TagInfo *out)
+{
+    if (!buf || n < 27 || out->sample_rate <= 0) return;
+    /* 从后向前扫描：找到的最后一个通过校验的页面即最后页面。 */
+    for (size_t i = n; i-- > 0; ) {
+        if (buf[i] != (uint8_t)'O' || i + 27 > n) continue;
+        if (memcmp(buf + i, "OggS", 4) != 0) continue;
+        uint8_t segs = buf[i + 26];
+        if (i + 27 + segs > n) continue;   /* segment table 越界，放弃此页 */
+        uint64_t granule = (uint64_t)buf[i + 6] |
+                           ((uint64_t)buf[i + 7] << 8) |
+                           ((uint64_t)buf[i + 8] << 16) |
+                           ((uint64_t)buf[i + 9] << 24) |
+                           ((uint64_t)buf[i + 10] << 32) |
+                           ((uint64_t)buf[i + 11] << 40) |
+                           ((uint64_t)buf[i + 12] << 48) |
+                           ((uint64_t)buf[i + 13] << 56);
+        if (granule == 0) continue;        /* 首页 granule 为 0，跳过 */
+        out->duration = (double)granule / out->sample_rate;
+        break;
+    }
+    /* 平均比特率 = 文件总字节 * 8 / 时长（秒）。 */
+    if (out->duration > 0 && out->file_size > 0)
+        out->bitrate = (int)((double)out->file_size * 8.0 / out->duration / 1000.0);
 }
 
 /* ---- WAV / RIFF parsing ---------------------------------------------- */
@@ -515,6 +582,7 @@ static void parse_wav(const uint8_t *buf, size_t buf_size, TagInfo *out) {
  * 根据 format 参数（FMT_MP3=1, FMT_FLAC=2, FMT_WAV=3, FMT_OGG=4）选择对应的解析器。
  * 先读取文件头部（最多 TAG_HEADER_BUF 字节）到缓冲区，再分发给各格式解析函数。
  * 对 MP3 文件，还会尾部读取 128 字节作为 ID3v1 降级方案。
+ * 对 OGG 文件，读取文件尾部以解析最后一页的 granule position，补齐时长和比特率。
  * 成功返回 0，失败返回 -1。调用者必须使用 tag_info_free() 释放 out 中的堆字符串。 */
 int tag_read(const wchar_t *path, int format, TagInfo *out) {
     if (!path || !out) return -1;
@@ -528,14 +596,30 @@ int tag_read(const wchar_t *path, int format, TagInfo *out) {
     switch (format) {
     case 1: {  /* FMT_MP3 */
         parse_id3v2(hdr, hdr_size, out);
+        /* ID3v2 标签总字节数（10 头 + 标签体 + 可选 footer）。 */
+        size_t id3_total = 0;
+        if (hdr_size >= 10 && memcmp(hdr, "ID3", 3) == 0) {
+            size_t id3sz = ((size_t)(hdr[6] & 0x7F) << 21) |
+                           ((size_t)(hdr[7] & 0x7F) << 14) |
+                           ((size_t)(hdr[8] & 0x7F) << 7)  |
+                            (size_t)(hdr[9] & 0x7F);
+            id3_total = 10 + id3sz;
+            if (hdr[5] & 0x10) id3_total += 10;  /* footer */
+        }
         int br = 0, sr = 0, ch = 0;
-        if (parse_mp3_first_frame(hdr, hdr_size, &br, &sr, &ch)) {
+        if (!parse_mp3_first_frame(hdr, hdr_size, &br, &sr, &ch) && id3_total > 0) {
+            /* 超大 ID3v2 标签（内嵌封面图）超出头部缓冲，seek 到标签末尾重试。 */
+            parse_mp3_frame_after_big_tag(path, id3_total, &br, &sr, &ch);
+        }
+        if (br > 0 && sr > 0) {
             out->bitrate     = br;
             out->sample_rate = sr;
             out->channels    = ch;
-            /* CBR approximation: file_size * 8 / bitrate. */
-            if (br > 0 && out->file_size > 0)
-                out->duration = (double)out->file_size * 8.0 / ((double)br * 1000.0);
+            /* CBR approximation: 音频字节数 × 8 / 比特率。
+             * 扣掉 ID3v2 标签体积，更接近真实音频大小。 */
+            long long audio_bytes = (long long)out->file_size - (long long)id3_total;
+            if (audio_bytes > 0)
+                out->duration = (double)audio_bytes * 8.0 / ((double)br * 1000.0);
         }
         /* ID3v1 fallback (only for fields ID3v2 didn't fill). */
         if ((!out->title || !out->artist || !out->album) && out->file_size >= 128) {
@@ -547,7 +631,20 @@ int tag_read(const wchar_t *path, int format, TagInfo *out) {
     }
     case 2:  parse_flac(hdr, hdr_size, out); break;  /* FMT_FLAC */
     case 3:  parse_wav (hdr, hdr_size, out); break;  /* FMT_WAV  */
-    case 4:  parse_ogg (hdr, hdr_size, out); break;  /* FMT_OGG  */
+    case 4: {                                        /* FMT_OGG  */
+        parse_ogg(hdr, hdr_size, out);
+        /* OGG 的精确时长记录在最后一个页面的 granule position 中，头部
+         * 解析不到；读取文件尾部补齐时长，并推算平均比特率。 */
+        if (out->sample_rate > 0 && out->file_size > 0) {
+            size_t tsz = 0;
+            uint8_t *tail = slurp_tail(path, TAG_HEADER_BUF, &tsz);
+            if (tail) {
+                ogg_duration_from_tail(tail, tsz, out);
+                free(tail);
+            }
+        }
+        break;
+    }
     default:
         free(hdr);
         return -1;

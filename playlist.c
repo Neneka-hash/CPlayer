@@ -431,8 +431,12 @@ void playlist_resume_tag_thread(void)
 /* ---- M3U playlist load/save ------------------------------------------ */
 
 /* 读取 M3U/M3U8 文件，将每条路径追加到当前播放列表。
- * 编码自动检测：文件以 UTF-8 BOM (EF BB BF) 开头按 UTF-8 解码；
- * 否则按系统 ANSI 代码页解码（中文系统即 GBK），兼容两种常见 M3U 编码。
+ * 编码检测，按优先级：
+ *   1. UTF-8 BOM (EF BB BF) → 按 UTF-8 解码；
+ *   2. 无 BOM → 先用严格 UTF-8 试解（合法 UTF-8 中文序列必然通过）；
+ *      失败说明是 ANSI 编码（中文系统即 GBK），回退到系统代码页。
+ * 这同时兼容 UTF-8（含无 BOM 的 UTF-8，如本程序旧版/第三方工具导出）
+ * 与 GBK/ANSI 两种常见 M3U 编码。
  * 相对路径基于 m3u 文件所在目录解析。
  * 跳过 #EXTM3U / #EXTINF 等以 # 开头的行和空行。
  * 返回实际成功添加的曲目数。 */
@@ -453,15 +457,14 @@ int playlist_load_m3u(const wchar_t *m3u_path)
     else
         dir[0] = 0;
 
-    /* 二进制读取、逐行按字节处理，BOM 决定 UTF-8 还是 ANSI(GBK)。
-     * 不用 _O_U8TEXT：它把无 BOM 的 ANSI 文件也当 UTF-8 转码，中文系统的
-     * GBK 编码 M3U 会被解析成乱码路径。 */
+    /* 二进制读取、逐行按字节处理。cp == 0 表示编码未定（无 BOM），
+     * 由第一行实际内容判定。 */
     FILE *fp = _wfopen(m3u_path, L"rb");
     if (!fp)
         return 0;
 
     int added = 0;
-    int cp = CP_ACP;        /* 无 BOM 时按系统 ANSI 代码页 */
+    int cp = 0;             /* 0 = 未定；否则 CP_UTF8 / CP_ACP */
     int first = 1;          /* 第一行用于 BOM 检测 */
     char raw[PATH_BUF * 3]; /* 字节行缓冲，足够容纳 PATH_BUF 个 wchar 的 UTF-8 */
     wchar_t line[PATH_BUF];
@@ -477,9 +480,8 @@ int playlist_load_m3u(const wchar_t *m3u_path)
                 memmove(raw, raw + 3, blen - 2);  /* 跳过 BOM */
                 blen -= 3;
                 cp = CP_UTF8;
-            } else {
-                cp = CP_ACP;
             }
+            /* 无 BOM：cp 保持 0，进入下面的启发式判定。 */
         }
 
         /* 去掉行尾 \r\n（字节层面）。 */
@@ -488,11 +490,28 @@ int playlist_load_m3u(const wchar_t *m3u_path)
         if (blen == 0)
             continue;            /* 空行 */
 
-        /* 解码为 wchar。 */
-        int n = MultiByteToWideChar(cp, 0, raw, (int)blen, line, PATH_BUF - 1);
-        if (n <= 0)
-            continue;            /* 解码失败，跳过该行 */
-        line[n] = 0;
+        int n;
+        if (cp == 0) {
+            /* 无 BOM：先用严格 UTF-8 试解。含中文的 UTF-8 序列必然合法；
+             * 失败（字节非法）则说明是 ANSI(GBK) 编码，回退代码页。 */
+            n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                    raw, (int)blen, line, PATH_BUF - 1);
+            if (n > 0) {
+                cp = CP_UTF8;
+            } else {
+                cp = CP_ACP;
+                n = MultiByteToWideChar(CP_ACP, 0,
+                                        raw, (int)blen, line, PATH_BUF - 1);
+            }
+            if (n <= 0)
+                continue;        /* 解码失败，跳过该行 */
+            line[n] = 0;
+        } else {
+            n = MultiByteToWideChar(cp, 0, raw, (int)blen, line, PATH_BUF - 1);
+            if (n <= 0)
+                continue;        /* 解码失败，跳过该行 */
+            line[n] = 0;
+        }
         if (line[0] == L'#')
             continue;            /* 跳过 #EXTM3U / #EXTINF */
 
