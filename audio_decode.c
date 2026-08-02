@@ -179,8 +179,10 @@ static Decoder *decoder_open_ogg(const wchar_t *path)
     FILE *f = _wfopen(path, L"rb");
     if (!f) return NULL;
     int err = 0;
+    /* close_on_free=TRUE：stb_vorbis 打开失败时内部已 fclose(f)，
+     * 此路径绝不能再次 fclose(f)（双重关闭是未定义行为）。 */
     stb_vorbis *v = stb_vorbis_open_file(f, TRUE, &err, NULL);
-    if (!v) { fclose(f); return NULL; }
+    if (!v) return NULL;
     Decoder *d = (Decoder *)calloc(1, sizeof(Decoder));
     if (!d) { stb_vorbis_close(v); return NULL; }
     stb_vorbis_info info = stb_vorbis_get_info(v);
@@ -429,16 +431,33 @@ static void handle_open(int index)
     LeaveCriticalSection(&g_player.cs);
     if (old) decoder_close(old);
 
-    /* 3. Open the new file (slow I/O, outside cs). */
-    if (index < 0 || index >= g_playlist.count) {
+    /* 3. Take a private copy of the pending-open path under cs, then open
+     * the file outside cs. Never dereference g_playlist.items[] here: the
+     * UI thread may clear/remove entries at any moment. player_open() (UI
+     * thread) already copied the path into g_player.open_path. */
+    EnterCriticalSection(&g_player.cs);
+    const wchar_t *src = g_player.open_path;
+    wchar_t *path = src ? _wcsdup(src) : NULL;
+    LeaveCriticalSection(&g_player.cs);
+
+    if (!path) {
         PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0, (LPARAM)L"无效的曲目索引");
         return;
     }
-    const wchar_t *path = g_playlist.items[index].path;
     Decoder *d = decoder_open(path);
+    free(path);   /* 局部拷贝用完即释放；open_path 本体由下一次 player_open 或 shutdown 释放 */
     if (!d) {
+        /* 打开失败：清理播放状态，避免界面卡在"正在播放"但无音频。 */
+        EnterCriticalSection(&g_player.cs);
+        g_player.state        = STATE_STOPPED;
+        g_player.cur_frame    = 0;
+        g_player.total_frames = 0;
+        g_player.eof          = 0;
+        g_player.ended_posted = 1;   /* 旧缓冲清空后不再报曲目结束 */
+        LeaveCriticalSection(&g_player.cs);
         PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0,
                     (LPARAM)L"无法打开文件（格式不支持或文件损坏）");
+        PostMessage(g_player.hMain, WM_TRACK_LOADED, 0, 0);  /* 刷新 UI 状态 */
         return;
     }
 
@@ -453,20 +472,48 @@ static void handle_open(int index)
     int rate              = decoder_rate(d);
     g_player.sample_rate  = rate;
 
-    if (g_player.wo_rate != rate) {
-        if (g_player.hwo) {
-            waveOutReset(g_player.hwo);
-            waveOutClose(g_player.hwo);
-            g_player.hwo = NULL;
-        }
-        LeaveCriticalSection(&g_player.cs);
-        waveout_open(rate, g_player.volume);   /* sets g_player.hwo */
-        EnterCriticalSection(&g_player.cs);
+    int need_reopen = (g_player.wo_rate != rate);
+    HWAVEOUT oldhwo = NULL;
+    if (need_reopen) {
+        oldhwo        = g_player.hwo;
+        g_player.hwo  = NULL;
+        g_player.wo_rate = 0;
+    }
+    LeaveCriticalSection(&g_player.cs);
+
+    /* 4b. (Re)open the waveOut device outside cs (may take time). */
+    if (oldhwo) { waveOutReset(oldhwo); waveOutClose(oldhwo); }
+    int ok = 1;
+    if (need_reopen)
+        ok = waveout_open(rate);          /* sets g_player.hwo */
+
+    /* 4c. Commit, or roll back on waveOut failure. */
+    EnterCriticalSection(&g_player.cs);
+    if (ok) {
         g_player.wo_rate = rate;
+        g_player.state   = STATE_PLAYING;
+        /* 新曲目代数：waveOut 发的 WM_TRACK_ENDED 若携带旧代数会被 UI 丢弃，
+         * 防止"上一首结束"误触发对新曲目的自动跳歌。 */
+        InterlockedIncrement(&g_player.track_gen);
+    } else {
+        /* waveOut 打开失败（无音频设备/设备忙）：关闭刚装的解码器并回到
+         * 停止态，否则解码器会持续填充、waveOut 不消费，形成静音死锁。 */
+        g_player.dec          = NULL;
+        g_player.state        = STATE_STOPPED;
+        g_player.sample_rate  = 0;
+        g_player.total_frames = 0;
+        g_player.cur_frame    = 0;
+        g_player.eof          = 1;
+        g_player.ended_posted = 1;
+        g_player.wo_rate      = 0;
+        LeaveCriticalSection(&g_player.cs);
+        decoder_close(d);
+        PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0,
+                    (LPARAM)L"无法打开音频输出设备");
+        PostMessage(g_player.hMain, WM_TRACK_LOADED, 0, 0);  /* 刷新 UI 状态 */
+        return;
     }
     waveout_set_volume(g_player.volume);
-
-    g_player.state = STATE_PLAYING;
     LeaveCriticalSection(&g_player.cs);
 
     /* 5. Kick the pipeline: decoder starts filling, UI refreshes. */

@@ -29,7 +29,9 @@ typedef struct {
     int      sample_rate; /* Hz, 0 if unknown */
     int      channels;    /* 0 if unknown */
     uint64_t file_size;   /* bytes, 0 if unknown */
-    int      tag_loaded;  /* 0 = tag not yet read, 1 = done */
+    volatile LONG tag_loaded;  /* 0 = tag not yet read, 1 = done.
+                                * Written by the UI thread, read by the tag
+                                * worker, hence volatile. */
 } PlaylistEntry;
 
 typedef struct {
@@ -44,6 +46,8 @@ typedef struct {
     volatile LONG  tag_cancel;    /* 1 = request stop                   */
     volatile LONG  tag_running;   /* 1 = thread active                  */
     volatile LONG  tag_restart;   /* 1 = rescan after current pass       */
+    volatile LONG  tag_suspended; /* 1 = don't auto-restart the thread   */
+                                   /* after a remove (batch deletion)     */
     volatile LONG  tag_epoch;     /* incremented on remove/clear; stale   */
                                    /* WM_TAGS_LOADED with old epoch are    */
                                    /* discarded by the UI handler          */
@@ -76,6 +80,15 @@ void playlist_fill_tag(int index);
  * thread exits. */
 void playlist_start_tag_thread(void);
 void playlist_stop_tag_thread(void);
+
+/* Suspend / resume the background tag reader across a batch of removals.
+ * playlist_suspend_tag_thread stops the thread and sets tag_suspended so
+ * that playlist_remove_at does NOT restart it after every single removal
+ * (which would churn one thread creation per deleted row). Call
+ * playlist_resume_tag_thread once the batch is done to bring the reader
+ * back up for the remaining entries. */
+void playlist_suspend_tag_thread(void);
+void playlist_resume_tag_thread(void);
 
 /* Recursively enumerate a directory and add supported audio files.
  * Returns the number added. */

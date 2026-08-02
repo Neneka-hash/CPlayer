@@ -768,9 +768,15 @@ static void delete_selected_items(void)
     if (deleting_current && state != STATE_STOPPED)
         player_stop();
 
+    /* 批量删除：先挂起 tag 线程，避免 playlist_remove_at 对每条删除都
+     * 停启一次线程（删除上千行会创建上千次线程）。 */
+    playlist_suspend_tag_thread();
+
     /* Remove highest index first so earlier indices stay valid. */
     for (int i = nsel - 1; i >= 0; i--)
         playlist_remove_at(sel[i]);
+
+    playlist_resume_tag_thread();
 
     /* Recompute cur_index: shift down by the number of removed rows that sat
      * above it; if it was itself removed, invalidate it. */
@@ -932,7 +938,7 @@ static LRESULT CALLBACK volume_subclass_proc(HWND hwnd, UINT msg,
 }
 
 /* ---- Forward declaration --------------------------------------------- */
-static void on_track_ended(void);
+static void on_track_ended(LONG gen);
 
 /* ---- Main window procedure ------------------------------------------- */
 LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1202,11 +1208,17 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         WORD id = LOWORD(wParam);
         const LangStrings *L = ui_lang();
         switch (id) {
-        case IDC_BTN_PLAY:
-            if (g_player.state == STATE_STOPPED && g_playlist.count > 0) {
+        case IDC_BTN_PLAY: {
+            /* state 由解码线程写，需持锁读（无锁读是正式的数据竞争）。 */
+            int state, cur;
+            EnterCriticalSection(&g_player.cs);
+            state = g_player.state;
+            cur   = g_player.cur_index;
+            LeaveCriticalSection(&g_player.cs);
+            if (state == STATE_STOPPED && g_playlist.count > 0) {
                 /* Start playing the selected item (or current, or first). */
                 int sel = ListView_GetNextItem(g_player.hList, -1, LVNI_SELECTED);
-                if (sel < 0) sel = g_player.cur_index;
+                if (sel < 0) sel = cur;
                 if (sel < 0) sel = 0;
                 player_open(sel);
             } else {
@@ -1214,6 +1226,7 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             ui_update_state_controls();
             break;
+        }
         case IDC_BTN_STOP:
             player_stop();
             break;
@@ -1259,8 +1272,17 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             save_m3u_dialog();
             break;
         case IDM_FILE_CLEAR:
-            playlist_clear();
+            /* 顺序：先发停止命令（异步），再清空列表。player_stop 只设置
+             * CMD_STOP，解码线程处理它时不访问播放列表，因此 clear 与
+             * handle_stop 并发安全；而 handle_open 只使用 player_open 在
+             * UI 线程拷贝的 open_path，同样不触碰 g_playlist。 */
             player_stop();
+            playlist_clear();
+            /* 清空后 cur_index 指向已释放/不存在的条目，必须重置，否则
+             * 之后"播放"按钮会拿着悬空索引去选曲。 */
+            EnterCriticalSection(&g_player.cs);
+            g_player.cur_index = -1;
+            LeaveCriticalSection(&g_player.cs);
             ui_refresh_playlist();
             ui_update_state_controls();
             break;
@@ -1427,13 +1449,20 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         /* A track's metadata (tags) finished loading in the background.
          * Do NOT rebuild the list (SetItemCountEx would lose scroll position).
          * Just refresh selection/focus and update the status text. */
-        ui_select_current(g_player.cur_index);
+        /* cur_index 由解码线程（handle_open 持锁）写入，此处持锁读取，
+         * 避免无锁读的数据竞争。 */
+        int cur;
+        EnterCriticalSection(&g_player.cs);
+        cur = g_player.cur_index;
+        LeaveCriticalSection(&g_player.cs);
+
+        ui_select_current(cur);
         ui_update_state_controls();
         ui_update_position();
 
-        if (g_player.cur_index >= 0 && g_player.cur_index < g_playlist.count) {
+        if (cur >= 0 && cur < g_playlist.count) {
             /* 标题优先于文件名；标签缺失时回退到 name。 */
-            const PlaylistEntry *e = &g_playlist.items[g_player.cur_index];
+            const PlaylistEntry *e = &g_playlist.items[cur];
             const wchar_t *title = e->title ? e->title : (e->name ? e->name : L"");
             ui_set_status(L->s_playing_title, title);
         }
@@ -1441,8 +1470,10 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_TRACK_ENDED:
-        /* Track finished playing; auto-advance or loop depending on mode. */
-        on_track_ended();
+        /* Track finished playing; auto-advance or loop depending on mode.
+         * wParam 携带该曲目的 track_gen：若期间用户已切到其他曲目，代数
+         * 不匹配即为过期消息，直接丢弃，避免误跳歌。 */
+        on_track_ended((LONG)wParam);
         return 0;
 
     case WM_TAGS_LOADED: {
@@ -1477,11 +1508,13 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
-    case WM_PLAYER_ERROR:
-        MessageBoxW(hwnd, (const wchar_t *)lParam, L"播放器错误",
+    case WM_PLAYER_ERROR: {
+        const LangStrings *L = ui_lang();
+        MessageBoxW(hwnd, (const wchar_t *)lParam, L->d_err_title,
                     MB_OK | MB_ICONWARNING);
         ui_update_state_controls();
         return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -1506,14 +1539,19 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 /* ---- Track-ended handling -------------------------------------------- */
-static void on_track_ended(void)
+static void on_track_ended(LONG gen)
 {
     int mode, cur, state;
+    LONG tgen;
     EnterCriticalSection(&g_player.cs);
     mode  = g_player.play_mode;
     cur   = g_player.cur_index;
     state = g_player.state;
+    tgen  = g_player.track_gen;
     LeaveCriticalSection(&g_player.cs);
+
+    /* 过期消息：曲目已切换（代数不匹配），丢弃，避免对当前曲目误跳歌。 */
+    if (gen != tgen) return;
 
     /* If the user stopped, don't auto-advance. */
     if (state == STATE_STOPPED) return;
@@ -1533,13 +1571,17 @@ void ui_refresh_language(void)
     HWND hMain = g_player.hMain;
     HMENU hMenu = GetMenu(hMain);
 
-    /* Update menu items. */
-    ModifyMenuW(hMenu, 0, MF_BYPOSITION | MF_STRING, 0, L->m_file);
-    ModifyMenuW(hMenu, 1, MF_BYPOSITION | MF_STRING, 1, L->m_lang);
-    ModifyMenuW(hMenu, 2, MF_BYPOSITION | MF_STRING, 2, L->m_help);
+    /* Update menu items.
+     * 关键：顶级三项是 MF_POPUP（各自挂子菜单）。ModifyMenu 若不带 MF_POPUP
+     * 会把该项改成普通字符串项并销毁其子菜单（微软文档明确该行为），导致
+     * 切换语言一次后文件/语言/帮助菜单全部失效。因此必须保留 MF_POPUP 并
+     * 把取到的子菜单句柄回传。 */
     HMENU hFile = GetSubMenu(hMenu, 0);
     HMENU hLangMenu = GetSubMenu(hMenu, 1);
     HMENU hHelp = GetSubMenu(hMenu, 2);
+    ModifyMenuW(hMenu, 0, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hFile, L->m_file);
+    ModifyMenuW(hMenu, 1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hLangMenu, L->m_lang);
+    ModifyMenuW(hMenu, 2, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hHelp, L->m_help);
     if (hFile) {
         ModifyMenuW(hFile, IDM_FILE_ADD_FILES, MF_BYCOMMAND | MF_STRING,
                     IDM_FILE_ADD_FILES, L->m_add_files);

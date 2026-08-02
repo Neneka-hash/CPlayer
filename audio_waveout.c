@@ -109,12 +109,13 @@ void pool_push_filled(PcmBlock *b)
  *
  * 使用 WAVE_MAPPER 打开默认音频输出设备，格式为立体声 16-bit PCM。
  * 设备通过事件回调（CALLBACK_EVENT）通知播放完成。
+ * 音量不在此处设置（避免无锁写 g_player.volume），由调用方持 cs 调用
+ * waveout_set_volume() 应用。
  *
  * @sample_rate: 采样率（Hz）
- * @volume:      初始音量 0..100
  * 返回: 1 成功，0 失败。
  */
-int waveout_open(int sample_rate, int volume)
+int waveout_open(int sample_rate)
 {
     WAVEFORMATEX wfx;
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -134,7 +135,6 @@ int waveout_open(int sample_rate, int volume)
     }
     /* 初始化为无信号状态，避免误处理上一次的完成事件 */
     ResetEvent(g_player.wo_event);
-    waveout_set_volume(volume);
     return 1;
 }
 
@@ -179,10 +179,21 @@ void waveout_set_volume(int vol)
  * player_open - 打开指定索引的曲目并开始播放
  *
  * @index: 播放列表中的曲目索引
+ *
+ * 在 UI 线程（持 cs）把曲目路径深拷贝到 g_player.open_path，解码线程
+ * handle_open 只使用这份私有拷贝，绝不无锁解引用 g_playlist.items[]，
+ * 从而消除"UI 清空/删除列表时解码线程读已释放内存"的竞态。播放列表的
+ * 所有修改都在 UI 线程完成，而本函数也在 UI 线程运行，故拷贝本身安全。
  */
 void player_open(int index)
 {
     EnterCriticalSection(&g_player.cs);
+    free(g_player.open_path);
+    g_player.open_path = NULL;
+    if (index >= 0 && index < g_playlist.count &&
+        g_playlist.items[index].path) {
+        g_player.open_path = _wcsdup(g_playlist.items[index].path);
+    }
     g_player.open_index = index;
     InterlockedExchange(&g_player.cmd, CMD_OPEN);
     LeaveCriticalSection(&g_player.cs);
@@ -327,6 +338,10 @@ void player_shutdown(void)
 
     waveout_close();
 
+    /* 释放未消费的待打开路径拷贝（player_open 分配） */
+    free(g_player.open_path);
+    g_player.open_path = NULL;
+
     if (g_player.wo_event)    { CloseHandle(g_player.wo_event);    g_player.wo_event = NULL; }
     if (g_player.wo_ctrl)     { CloseHandle(g_player.wo_ctrl);     g_player.wo_ctrl = NULL; }
     if (g_player.dec_event)   { CloseHandle(g_player.dec_event);   g_player.dec_event = NULL; }
@@ -457,12 +472,19 @@ DWORD WINAPI waveout_thread_proc(LPVOID param)
             if (g_player.blocks[i].state == BS_PLAYING) have_playing = 1;
 
         /* --- 4. 曲目结束检测 ------------------------------------------- */
+        /* 携带当前 track_gen：若消息入队期间用户已切到新曲目，UI 收到后
+         * 会因代数不匹配而丢弃，避免"旧曲结束"误触发对新曲的自动跳歌。 */
+        LONG ended_gen = -1;
         if (g_player.eof && !g_player.ended_posted && !has_pending_audio()) {
             g_player.ended_posted = 1;
-            PostMessage(g_player.hMain, WM_TRACK_ENDED, 0, 0);
+            ended_gen = g_player.track_gen;
         }
 
         LeaveCriticalSection(&g_player.cs);
+
+        if (ended_gen >= 0)
+            PostMessage(g_player.hMain, WM_TRACK_ENDED,
+                        (WPARAM)ended_gen, 0);
 
         /* --- 等待下一个感兴趣的事件 ------------------------------------ */
         if (have_playing) {

@@ -104,8 +104,12 @@ typedef struct Decoder Decoder;
 /* Messages posted from worker threads (decoder, tag_reader) to the main
  * window. Handled in win32_ui.c WndProc. */
 #define WM_TRACK_LOADED    (WM_USER + 1)   /* decoder thread: a new track finished opening  */
-#define WM_TRACK_ENDED     (WM_USER + 2)   /* decoder thread: decoder hit EOF, playback stopped */
-#define WM_PLAYER_ERROR    (WM_USER + 3)   /* any thread: wParam = 0, lParam = error string (heap) */
+#define WM_TRACK_ENDED     (WM_USER + 2)   /* decoder thread: decoder hit EOF, playback stopped;
+                                            * wParam = track_gen of the track that ended, so the
+                                            * UI can discard stale messages from a previous track */
+#define WM_PLAYER_ERROR    (WM_USER + 3)   /* any thread: wParam = 0, lParam = error text.
+                                            * lParam points to a STATIC string literal owned by the
+                                            * caller — the UI must NOT free it. */
 #define WM_TAGS_LOADED     (WM_USER + 4)   /* tag_reader thread: background tag read finished for one file:
                                             * wParam = playlist index, lParam = TagInfo* (heap-allocated) */
 
@@ -152,6 +156,23 @@ typedef struct {
     volatile LONG64 seek_frame;    /* target frame for CMD_SEEK               */
     volatile LONG flushing;        /* decoder owns; waveOut observes          */
     volatile LONG wo_idle;         /* waveOut owns; decoder observes          */
+
+    /* --- Pending-open path (owned by UI thread, read by decoder thread) ---
+     * Set by player_open() under cs as a private _wcsdup copy of the
+     * playlist entry's path, so the decoder thread (handle_open) never has
+     * to dereference g_playlist.items[] without synchronization. The UI
+     * thread is the only writer of the playlist, and player_open() also runs
+     * on the UI thread, so the copy itself is race-free. The decoder thread
+     * copies it again under cs and uses the local copy outside the lock. */
+    wchar_t        *open_path;    /* NULL when no open is pending            */
+
+    /* --- Track generation counter ---
+     * Incremented (under cs) every time handle_open installs a new track.
+     * waveOut stamps WM_TRACK_ENDED with the generation at post time; the
+     * UI discards the message if the generation no longer matches, which
+     * prevents a stale "track ended" from a previous track auto-advancing
+     * past a track the user already switched to. */
+    volatile LONG track_gen;       /* current track's generation number      */
 
     /* --- UI (main thread only, except dpi read in DPICHANGED) --- */
     HWND hMain;

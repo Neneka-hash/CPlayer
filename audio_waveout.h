@@ -28,9 +28,10 @@ void      pool_push_filled(PcmBlock *b);
 
 /* ---- waveOut 设备管理 ------------------------------------------------- */
 
-/* 打开/关闭 waveOut 设备，指定采样率（立体声 16-bit）。volume 为 0..100。
+/* 打开/关闭 waveOut 设备，指定采样率（立体声 16-bit）。
+ * 音量由调用方持锁调用 waveout_set_volume() 设置。
  * 成功返回 1。 */
-int  waveout_open(int sample_rate, int volume);
+int  waveout_open(int sample_rate);
 void waveout_close(void);
 
 /* 立即应用音量 0..100。 */

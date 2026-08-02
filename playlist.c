@@ -30,6 +30,7 @@ void playlist_init(void)
     g_playlist.tag_cancel  = 0;
     g_playlist.tag_running = 0;
     g_playlist.tag_restart = 0;
+    g_playlist.tag_suspended = 0;
     g_playlist.tag_epoch   = 0;
 }
 
@@ -203,8 +204,11 @@ void playlist_remove_at(int index)
     for (int i = index; i < g_playlist.count - 1; i++)
         g_playlist.items[i] = g_playlist.items[i + 1];
     g_playlist.count--;
-    /* Restart tag reading for the remaining items. */
-    playlist_start_tag_thread();
+    /* Restart tag reading for the remaining items — unless the caller is
+     * in the middle of a batch deletion (tag_suspended), in which case the
+     * thread is brought back once by playlist_resume_tag_thread(). */
+    if (!InterlockedExchangeAdd(&g_playlist.tag_suspended, 0))
+        playlist_start_tag_thread();
 }
 
 /* Remove all entries. The tag thread is stopped before freeing entries
@@ -346,19 +350,25 @@ static DWORD WINAPI tag_worker_thread(LPVOID param)
                 TagInfo *heap = (TagInfo *)malloc(sizeof(TagInfo));
                 if (heap) {
                     *heap = ti;
-                    PostMessage(g_player.hMain, WM_TAGS_LOADED,
-                                (WPARAM)i, (LPARAM)heap);
-                    continue;
+                    /* If the main window is gone (shutdown), the message
+                     * cannot be delivered — release the payload now. */
+                    if (PostMessage(g_player.hMain, WM_TAGS_LOADED,
+                                    (WPARAM)i, (LPARAM)heap))
+                        continue;
+                    tag_info_free(heap);
+                    free(heap);
+                } else {
+                    tag_info_free(&ti);
                 }
-                tag_info_free(&ti);
             }
             /* tag_read failed or malloc failed: send an empty TagInfo so
              * the UI thread marks tag_loaded = 1 and stops retrying. */
             TagInfo *empty = (TagInfo *)calloc(1, sizeof(TagInfo));
             if (empty) {
                 empty->epoch = epoch;
-                PostMessage(g_player.hMain, WM_TAGS_LOADED,
-                            (WPARAM)i, (LPARAM)empty);
+                if (!PostMessage(g_player.hMain, WM_TAGS_LOADED,
+                                 (WPARAM)i, (LPARAM)empty))
+                    free(empty);
             }
         }
     } while (InterlockedExchangeAdd(&g_playlist.tag_restart, 0));
@@ -404,10 +414,25 @@ void playlist_stop_tag_thread(void)
     InterlockedExchange(&g_playlist.tag_cancel, 0);
 }
 
+/* Suspend the tag reader across a batch of removals. */
+void playlist_suspend_tag_thread(void)
+{
+    InterlockedExchange(&g_playlist.tag_suspended, 1);
+    playlist_stop_tag_thread();
+}
+
+/* Resume the tag reader after a batch of removals. */
+void playlist_resume_tag_thread(void)
+{
+    InterlockedExchange(&g_playlist.tag_suspended, 0);
+    playlist_start_tag_thread();
+}
+
 /* ---- M3U playlist load/save ------------------------------------------ */
 
 /* 读取 M3U/M3U8 文件，将每条路径追加到当前播放列表。
- * 用 _O_U8TEXT 模式让 C 运行时自动处理 UTF-8 (含 BOM) 到 wchar_t 的转换。
+ * 编码自动检测：文件以 UTF-8 BOM (EF BB BF) 开头按 UTF-8 解码；
+ * 否则按系统 ANSI 代码页解码（中文系统即 GBK），兼容两种常见 M3U 编码。
  * 相对路径基于 m3u 文件所在目录解析。
  * 跳过 #EXTM3U / #EXTINF 等以 # 开头的行和空行。
  * 返回实际成功添加的曲目数。 */
@@ -428,22 +453,46 @@ int playlist_load_m3u(const wchar_t *m3u_path)
     else
         dir[0] = 0;
 
-    /* 用 _O_U8TEXT 模式打开，fgetws 自动把 UTF-8 转成 wchar_t，
-     * 同时自动跳过 BOM。 */
-    FILE *fp = _wfopen(m3u_path, L"r");
+    /* 二进制读取、逐行按字节处理，BOM 决定 UTF-8 还是 ANSI(GBK)。
+     * 不用 _O_U8TEXT：它把无 BOM 的 ANSI 文件也当 UTF-8 转码，中文系统的
+     * GBK 编码 M3U 会被解析成乱码路径。 */
+    FILE *fp = _wfopen(m3u_path, L"rb");
     if (!fp)
         return 0;
-    _setmode(_fileno(fp), _O_U8TEXT);
 
     int added = 0;
+    int cp = CP_ACP;        /* 无 BOM 时按系统 ANSI 代码页 */
+    int first = 1;          /* 第一行用于 BOM 检测 */
+    char raw[PATH_BUF * 3]; /* 字节行缓冲，足够容纳 PATH_BUF 个 wchar 的 UTF-8 */
     wchar_t line[PATH_BUF];
-    while (fgetws(line, PATH_BUF, fp)) {
-        /* 去掉行尾 \r\n。 */
-        size_t n = wcslen(line);
-        while (n > 0 && (line[n-1] == L'\n' || line[n-1] == L'\r'))
-            line[--n] = 0;
-        if (n == 0)
+
+    while (fgets(raw, (int)sizeof(raw), fp)) {
+        size_t blen = strlen(raw);
+        if (first) {
+            first = 0;
+            if (blen >= 3 &&
+                (unsigned char)raw[0] == 0xEF &&
+                (unsigned char)raw[1] == 0xBB &&
+                (unsigned char)raw[2] == 0xBF) {
+                memmove(raw, raw + 3, blen - 2);  /* 跳过 BOM */
+                blen -= 3;
+                cp = CP_UTF8;
+            } else {
+                cp = CP_ACP;
+            }
+        }
+
+        /* 去掉行尾 \r\n（字节层面）。 */
+        while (blen > 0 && (raw[blen-1] == '\n' || raw[blen-1] == '\r'))
+            raw[--blen] = 0;
+        if (blen == 0)
             continue;            /* 空行 */
+
+        /* 解码为 wchar。 */
+        int n = MultiByteToWideChar(cp, 0, raw, (int)blen, line, PATH_BUF - 1);
+        if (n <= 0)
+            continue;            /* 解码失败，跳过该行 */
+        line[n] = 0;
         if (line[0] == L'#')
             continue;            /* 跳过 #EXTM3U / #EXTINF */
 
