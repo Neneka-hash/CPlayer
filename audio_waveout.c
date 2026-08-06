@@ -126,15 +126,21 @@ int waveout_open(int sample_rate)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    MMRESULT mr = waveOutOpen(&g_player.hwo, WAVE_MAPPER, &wfx,
+    /* 先写局部变量：waveOutOpen 在解码线程上执行，而 waveOut 线程在
+     * cs 内读 g_player.hwo——直接写入全局会造成无锁数据竞争（x64 上
+     * 原子但属 C11 UB）。句柄先在局部取得，成功后持锁提交。 */
+    HWAVEOUT hwo = NULL;
+    MMRESULT mr = waveOutOpen(&hwo, WAVE_MAPPER, &wfx,
                               (DWORD_PTR)g_player.wo_event, 0,
                               CALLBACK_EVENT);
-    if (mr != MMSYSERR_NOERROR) {
-        g_player.hwo = NULL;
+    if (mr != MMSYSERR_NOERROR)
         return 0;
-    }
     /* 初始化为无信号状态，避免误处理上一次的完成事件 */
     ResetEvent(g_player.wo_event);
+
+    EnterCriticalSection(&g_player.cs);
+    g_player.hwo = hwo;
+    LeaveCriticalSection(&g_player.cs);
     return 1;
 }
 
@@ -392,7 +398,22 @@ DWORD WINAPI waveout_thread_proc(LPVOID param)
     (void)param;
 
     for (;;) {
-        if (g_player.quit) break;
+        if (g_player.quit) {
+            /* 退出前若正处于 flush 握手期间，必须先把 wo_idle 置位并唤醒
+             * 解码线程；否则解码线程会永远等在 flush_wait_idle() 上，
+             * 使 player_shutdown 的 WaitForSingleObject(dec_thread) 死锁。
+             * 若不在 flush 期间，直接退出即可（wo_idle 无关紧要）。 */
+            EnterCriticalSection(&g_player.cs);
+            if (g_player.flushing) {
+                g_player.flushing = 0;
+                g_player.wo_idle  = 1;
+                LeaveCriticalSection(&g_player.cs);
+                SetEvent(g_player.wo_idle_evt);
+            } else {
+                LeaveCriticalSection(&g_player.cs);
+            }
+            break;
+        }
 
         EnterCriticalSection(&g_player.cs);
 
@@ -445,6 +466,9 @@ DWORD WINAPI waveout_thread_proc(LPVOID param)
 
         /* --- 3. 提交已填充的数据块 -------------------------------------- */
         int have_playing = 0;
+        int submit_fail  = 0;
+        int submit_ok    = 0;
+        int err_code     = 0;
         if (hwo && g_player.state == STATE_PLAYING) {
             for (int i = 0; i < NUM_BUFFERS; i++) {
                 PcmBlock *b = &g_player.blocks[i];
@@ -456,16 +480,19 @@ DWORD WINAPI waveout_thread_proc(LPVOID param)
                 if (waveOutPrepareHeader(hwo, &b->hdr, sizeof(WAVEHDR))
                         != MMSYSERR_NOERROR) {
                     b->state = BS_FREE;          /* 准备失败，放弃该数据块 */
+                    submit_fail = 1;
                     continue;
                 }
                 if (waveOutWrite(hwo, &b->hdr, sizeof(WAVEHDR))
                         != MMSYSERR_NOERROR) {
                     waveOutUnprepareHeader(hwo, &b->hdr, sizeof(WAVEHDR));
                     b->state = BS_FREE;
+                    submit_fail = 1;
                     continue;
                 }
                 b->state = BS_PLAYING;
                 have_playing = 1;
+                submit_ok   = 1;
             }
         }
         for (int i = 0; i < NUM_BUFFERS; i++)
@@ -480,11 +507,27 @@ DWORD WINAPI waveout_thread_proc(LPVOID param)
             ended_gen = g_player.track_gen;
         }
 
+        /* --- 提交失败处理 ----------------------------------------------- */
+        /* 被放弃的块已回到 BS_FREE，必须唤醒解码器，否则 8 块全部提交
+         * 失败后解码线程会永远睡在 dec_event 上（静默死锁）。错误弹窗
+         * 只报一次，直到某次提交恢复成功才允许再次上报，避免刷屏。 */
+        if (submit_fail)
+            SetEvent(g_player.dec_event);
+        if (submit_ok)
+            g_player.wo_err_posted = 0;
+        else if (submit_fail && !g_player.wo_err_posted) {
+            g_player.wo_err_posted = 1;
+            err_code = PLAYER_ERR_DEVICE_WRITE;
+        }
+
         LeaveCriticalSection(&g_player.cs);
 
         if (ended_gen >= 0)
             PostMessage(g_player.hMain, WM_TRACK_ENDED,
                         (WPARAM)ended_gen, 0);
+        if (err_code)
+            PostMessage(g_player.hMain, WM_PLAYER_ERROR,
+                        (WPARAM)err_code, 0);
 
         /* --- 等待下一个感兴趣的事件 ------------------------------------ */
         if (have_playing) {

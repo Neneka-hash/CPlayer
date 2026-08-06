@@ -32,7 +32,11 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 ( echo ERROR: vcvars64.bat failed & exit /b 1 )
 
 REM --- 3. Compile resources (manifest + version info) ----------
-rc.exe /nologo /fo app.res app.rc
+REM Intermediate outputs go to build\ so the source dir stays clean.
+REM NOTE: keep this file ASCII-only - cmd.exe parses .bat with the ANSI
+REM codepage, and non-ASCII bytes (e.g. UTF-8 Chinese) corrupt parsing.
+if not exist build mkdir build
+rc.exe /nologo /fo build\app.res app.rc
 if errorlevel 1 ( echo FAILED: rc.exe & exit /b 1 )
 
 REM --- 4. Compile + link ---------------------------------------
@@ -58,9 +62,9 @@ REM    /MERGE:.rdata=.text - fold read-only data into the code section
 REM                          (saves a section header + alignment padding)
 cl.exe /nologo /std:c11 /utf-8 /O1 /GS- /GL /Gy /Gw /MD /EHa- ^
     /DNDEBUG /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0600 ^
-    /Fe:cplayer.exe ^
+    /Fo:build\ /Fe:cplayer.exe ^
     main.c win32_ui.c playlist.c audio_decode.c audio_waveout.c tag_reader.c ^
-    app.res ^
+    build\app.res ^
     /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /MERGE:.rdata=.text ^
     /MANIFEST:EMBED /MANIFESTINPUT:app.manifest ^
     user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib winmm.lib

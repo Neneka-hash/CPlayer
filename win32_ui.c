@@ -57,6 +57,7 @@ typedef struct {
     const wchar_t *d_reg_failed, *d_create_failed;
     const wchar_t *d_alloc_buf, *d_start_thread;
     const wchar_t *d_err_title, *d_info_title;
+    const wchar_t *d_err_index, *d_err_open, *d_err_device, *d_err_output;
     const wchar_t *d_add_title, *d_folder_title;
     const wchar_t *d_load_m3u_title, *d_save_m3u_title;
     /* File dialog filters */
@@ -101,6 +102,10 @@ static const LangStrings LANG_ZH_STRINGS = {
     L"无法分配音频缓冲区",
     L"无法启动音频线程",
     L"CPlayer", L"CPlayer",
+    L"无效的曲目索引",
+    L"无法打开文件（格式不支持或文件损坏）",
+    L"无法打开音频输出设备",
+    L"音频输出失败（设备可能已断开）",
     L"添加音频文件",
     L"选择包含音频文件的文件夹",
     L"读取 M3U 播放列表",
@@ -155,6 +160,10 @@ static const LangStrings LANG_EN_STRINGS = {
     L"Failed to allocate audio buffer",
     L"Failed to start audio thread",
     L"CPlayer", L"CPlayer",
+    L"Invalid track index",
+    L"Cannot open file (unsupported format or corrupt file)",
+    L"Cannot open audio output device",
+    L"Audio output failed (device may be disconnected)",
     L"Add audio files",
     L"Select a folder containing audio files",
     L"Load M3U playlist",
@@ -209,6 +218,10 @@ static const LangStrings LANG_ES_STRINGS = {
     L"Error al asignar el b\x00fafer de audio",
     L"Error al iniciar el hilo de audio",
     L"CPlayer", L"CPlayer",
+    L"Índice de pista no válido",
+    L"No se puede abrir el archivo (formato no compatible o archivo dañado)",
+    L"No se puede abrir el dispositivo de salida de audio",
+    L"Error de salida de audio (el dispositivo puede estar desconectado)",
     L"Agregar archivos de audio",
     L"Seleccione una carpeta que contenga archivos de audio",
     L"Cargar lista de reproducci\x00f3n M3U",
@@ -263,6 +276,10 @@ static const LangStrings LANG_FR_STRINGS = {
     L"\x00c9" L"chec de l'allocation du tampon audio",
     L"\x00c9" L"chec du d\x00e9marrage du thread audio",
     L"CPlayer", L"CPlayer",
+    L"Index de piste invalide",
+    L"Impossible d'ouvrir le fichier (format non pris en charge ou fichier corrompu)",
+    L"Impossible d'ouvrir le périphérique de sortie audio",
+    L"Échec de la sortie audio (le périphérique est peut-être déconnecté)",
     L"Ajouter des fichiers audio",
     L"S\x00e9lectionnez un dossier contenant des fichiers audio",
     L"Charger une liste de lecture M3U",
@@ -317,6 +334,10 @@ static const LangStrings LANG_JA_STRINGS = {
     L"\x30aa\x30fc\x30c7\x30a3\x30aa\x30d0\x30c3\x30d5\x30a1\x306e\x5272\x308a\x5f53\x3066\x306b\x5931\x6557\x3057\x307e\x3057\x305f",
     L"\x30aa\x30fc\x30c7\x30a3\x30aa\x30b9\x30ec\x30c3\x30c9\x306e\x8d77\x52d5\x306b\x5931\x6557\x3057\x307e\x3057\x305f",
     L"CPlayer", L"CPlayer",
+    L"無効なトラックインデックス",
+    L"ファイルを開けません（非対応形式またはファイル破損）",
+    L"オーディオ出力デバイスを開けません",
+    L"オーディオ出力に失敗しました（デバイスが切断された可能性があります）",
     L"\x30aa\x30fc\x30c7\x30a3\x30aa\x30d5\x30a1\x30a4\x30eb\x3092\x8ffd\x52a0",
     L"\x30aa\x30fc\x30c7\x30a3\x30aa\x30d5\x30a1\x30a4\x30eb\x3092\x542b\x3080\x30d5\x30a9\x30eb\x30c0\x3092\x9078\x629e",
     L"M3U \x30d7\x30ec\x30a4\x30ea\x30b9\x30c8\x3092\x8aad\x307f\x8fbc\x3080",
@@ -1510,8 +1531,15 @@ LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_PLAYER_ERROR: {
         const LangStrings *L = ui_lang();
-        MessageBoxW(hwnd, (const wchar_t *)lParam, L->d_err_title,
-                    MB_OK | MB_ICONWARNING);
+        const wchar_t *msg = NULL;
+        switch ((int)wParam) {
+        case PLAYER_ERR_INVALID_INDEX: msg = L->d_err_index;  break;
+        case PLAYER_ERR_OPEN_FAILED:   msg = L->d_err_open;   break;
+        case PLAYER_ERR_DEVICE_OPEN:   msg = L->d_err_device; break;
+        case PLAYER_ERR_DEVICE_WRITE:  msg = L->d_err_output; break;
+        default:                       msg = (const wchar_t *)lParam; break;
+        }
+        MessageBoxW(hwnd, msg, L->d_err_title, MB_OK | MB_ICONWARNING);
         ui_update_state_controls();
         return 0;
     }

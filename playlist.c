@@ -230,6 +230,17 @@ void playlist_clear(void)
     g_playlist.capacity = 0;
 }
 
+/* 随机播放种子：首次使用随机模式时以系统时间为种子，避免每次启动
+ * 的随机序列完全相同。 */
+static void shuffle_seed_once(void)
+{
+    static volatile int seeded = 0;
+    if (!seeded) {
+        srand((unsigned)GetTickCount64() ^ (unsigned)(uintptr_t)&seeded);
+        seeded = 1;
+    }
+}
+
 /* Return the next index to play given the current index and play mode. */
 int playlist_next_index(int cur, int mode)
 {
@@ -242,9 +253,14 @@ int playlist_next_index(int cur, int mode)
     case MODE_SINGLE_LOOP:
         return cur;
     case MODE_SHUFFLE: {
+        shuffle_seed_once();
         int nxt;
-        /* Pick a random index different from current. */
-        do { nxt = rand() % n; } while (nxt == cur);
+        do {
+            int r;
+            /* 拒绝采样消除 rand()%n 的模偏差。 */
+            do { r = rand(); } while (r >= RAND_MAX - RAND_MAX % n);
+            nxt = r % n;
+        } while (nxt == cur);  /* pick a random index different from current */
         return nxt;
     }
     case MODE_LIST_LOOP:
@@ -265,8 +281,14 @@ int playlist_prev_index(int cur, int mode)
     case MODE_SINGLE_LOOP:
         return cur;
     case MODE_SHUFFLE: {
+        shuffle_seed_once();
         int prv;
-        do { prv = rand() % n; } while (prv == cur);
+        do {
+            int r;
+            /* 与 next 分支一致：拒绝采样消除 rand()%n 的模偏差。 */
+            do { r = rand(); } while (r >= RAND_MAX - RAND_MAX % n);
+            prv = r % n;
+        } while (prv == cur);
         return prv;
     }
     case MODE_LIST_LOOP:

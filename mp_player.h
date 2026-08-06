@@ -107,11 +107,20 @@ typedef struct Decoder Decoder;
 #define WM_TRACK_ENDED     (WM_USER + 2)   /* decoder thread: decoder hit EOF, playback stopped;
                                             * wParam = track_gen of the track that ended, so the
                                             * UI can discard stale messages from a previous track */
-#define WM_PLAYER_ERROR    (WM_USER + 3)   /* any thread: wParam = 0, lParam = error text.
-                                            * lParam points to a STATIC string literal owned by the
-                                            * caller — the UI must NOT free it. */
+#define WM_PLAYER_ERROR    (WM_USER + 3)   /* any thread: wParam = PLAYER_ERR_* code, lParam = 0.
+                                            * The UI resolves the text from the current language
+                                            * pack, so the message follows runtime language
+                                            * switches. Kept as a fallback: if wParam is 0 the
+                                            * UI treats lParam as a static string literal the
+                                            * caller owns and must NOT free. */
 #define WM_TAGS_LOADED     (WM_USER + 4)   /* tag_reader thread: background tag read finished for one file:
                                             * wParam = playlist index, lParam = TagInfo* (heap-allocated) */
+
+/* Error codes for WM_PLAYER_ERROR (posted by decoder / waveOut threads). */
+#define PLAYER_ERR_INVALID_INDEX 1  /* 曲目索引无效（列表被清空/越界） */
+#define PLAYER_ERR_OPEN_FAILED   2  /* 无法打开文件（格式不支持或损坏） */
+#define PLAYER_ERR_DEVICE_OPEN   3  /* 无法打开音频输出设备 */
+#define PLAYER_ERR_DEVICE_WRITE  4  /* 音频输出失败（设备可能已断开） */
 
 /* ---- Central player state -------------------------------------------- */
 typedef struct {
@@ -136,6 +145,9 @@ typedef struct {
     HWAVEOUT hwo;                  /* waveOut device handle, NULL if closed  */
     int      wo_rate;              /* rate hwo was opened at, 0 if closed    */
     int      volume;               /* 0..100, applied on open and on change  */
+    int      wo_err_posted;        /* 1 after a device-write error was reported;
+                                       cleared once a submit succeeds, so the
+                                       error dialog is not spammed (protected by cs) */
 
     /* --- PCM buffer pool (protected by cs) --- */
     PcmBlock blocks[NUM_BUFFERS];

@@ -397,10 +397,13 @@ static void flush_start(void)
     SetEvent(g_player.wo_ctrl);     /* wake waveOut so it sees flushing */
 }
 
-/* Wait until waveOut reports idle. cs NOT held during the wait. */
+/* Wait until waveOut reports idle. cs NOT held during the wait.
+ * 若 quit 已置位（waveOut 线程可能已退出、永远不会报告 idle）则立即
+ * 返回，避免 player_shutdown 时死锁；waveOut 线程退出前也会主动完成
+ * flush 握手（见 waveout_thread_proc 顶部 quit 分支），双保险。 */
 static void flush_wait_idle(void)
 {
-    while (!g_player.wo_idle)
+    while (!g_player.wo_idle && !g_player.quit)
         WaitForSingleObject(g_player.wo_idle_evt, INFINITE);
 }
 
@@ -414,7 +417,7 @@ static void flush_end(void)
 /* ---- Command handlers ------------------------------------------------- */
 
 /* Handle CMD_OPEN: flush pipeline, close old decoder, open new file, (re)init waveOut, start playback. */
-static void handle_open(int index)
+static void handle_open(void)
 {
     /* 1. Flush the waveOut pipeline so all blocks return to BS_FREE. */
     EnterCriticalSection(&g_player.cs);
@@ -434,14 +437,18 @@ static void handle_open(int index)
     /* 3. Take a private copy of the pending-open path under cs, then open
      * the file outside cs. Never dereference g_playlist.items[] here: the
      * UI thread may clear/remove entries at any moment. player_open() (UI
-     * thread) already copied the path into g_player.open_path. */
+     * thread) already copied the path into g_player.open_path.
+     * index 与 path 在同一个临界区内快照，保证二者来自同一次 player_open
+     * 调用——避免快速连点切歌时"新路径 + 旧索引"的撕裂。 */
     EnterCriticalSection(&g_player.cs);
-    const wchar_t *src = g_player.open_path;
-    wchar_t *path = src ? _wcsdup(src) : NULL;
+    int index            = g_player.open_index;
+    const wchar_t *src   = g_player.open_path;
+    wchar_t *path        = src ? _wcsdup(src) : NULL;
     LeaveCriticalSection(&g_player.cs);
 
     if (!path) {
-        PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0, (LPARAM)L"无效的曲目索引");
+        PostMessage(g_player.hMain, WM_PLAYER_ERROR,
+                    (WPARAM)PLAYER_ERR_INVALID_INDEX, 0);
         return;
     }
     Decoder *d = decoder_open(path);
@@ -455,8 +462,8 @@ static void handle_open(int index)
         g_player.eof          = 0;
         g_player.ended_posted = 1;   /* 旧缓冲清空后不再报曲目结束 */
         LeaveCriticalSection(&g_player.cs);
-        PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0,
-                    (LPARAM)L"无法打开文件（格式不支持或文件损坏）");
+        PostMessage(g_player.hMain, WM_PLAYER_ERROR,
+                    (WPARAM)PLAYER_ERR_OPEN_FAILED, 0);
         PostMessage(g_player.hMain, WM_TRACK_LOADED, 0, 0);  /* 刷新 UI 状态 */
         return;
     }
@@ -508,8 +515,8 @@ static void handle_open(int index)
         g_player.wo_rate      = 0;
         LeaveCriticalSection(&g_player.cs);
         decoder_close(d);
-        PostMessage(g_player.hMain, WM_PLAYER_ERROR, 0,
-                    (LPARAM)L"无法打开音频输出设备");
+        PostMessage(g_player.hMain, WM_PLAYER_ERROR,
+                    (WPARAM)PLAYER_ERR_DEVICE_OPEN, 0);
         PostMessage(g_player.hMain, WM_TRACK_LOADED, 0, 0);  /* 刷新 UI 状态 */
         return;
     }
@@ -630,7 +637,7 @@ DWORD WINAPI decoder_thread_proc(LPVOID param)
         LeaveCriticalSection(&g_player.cs);
 
         switch (cmd) {
-        case CMD_OPEN: handle_open((int)g_player.open_index); break;
+        case CMD_OPEN: handle_open(); break;
         case CMD_SEEK: handle_seek((uint64_t)g_player.seek_frame); break;
         case CMD_STOP: handle_stop(); break;
         default: break;

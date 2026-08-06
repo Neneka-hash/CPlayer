@@ -141,8 +141,16 @@ static wchar_t *decode_id3_text(const uint8_t *data, size_t length) {
     uint8_t enc = data[0];
     const uint8_t *text = data + 1;
     size_t textlen = length - 1;
-    /* Strip trailing NULs (frames often have one or two padding NULs). */
-    while (textlen > 0 && text[textlen - 1] == 0) textlen--;
+    /* Strip trailing NULs (frames often have one or two padding NULs).
+     * UTF-16 编码必须按 2 字节（一个完整 wchar）为单位剥：逐字节剥会把
+     * 正常字符的低字节 0x00 误删（如 ASCII 'X' 的 UTF-16LE 字节 58 00），
+     * 产生奇数长度，utf16le_to_wstr 的 len/2 会丢掉半个字符。 */
+    if (enc == 1 || enc == 2) {
+        while (textlen >= 2 && text[textlen - 2] == 0 && text[textlen - 1] == 0)
+            textlen -= 2;
+    } else {
+        while (textlen > 0 && text[textlen - 1] == 0) textlen--;
+    }
 
     switch (enc) {
     case 0:  /* ISO-8859-1 -> treat as CP1252 (Windows superset) */
@@ -492,10 +500,14 @@ static void parse_ogg(const uint8_t *buf, size_t buf_size, TagInfo *out) {
 static void ogg_duration_from_tail(const uint8_t *buf, size_t n, TagInfo *out)
 {
     if (!buf || n < 27 || out->sample_rate <= 0) return;
-    /* 从后向前扫描：找到的最后一个通过校验的页面即最后页面。 */
+    /* 从后向前扫描：找到的最后一个通过校验的页面即最后页面。
+     * 校验：页魔数 OggS + 版本必须为 0 + 保留位（页头字节 5 的高 4 位）
+     * 必须清零，避免 Vorbis 注释文本内嵌的 "OggS" 字节串被误判为页头。 */
     for (size_t i = n; i-- > 0; ) {
         if (buf[i] != (uint8_t)'O' || i + 27 > n) continue;
         if (memcmp(buf + i, "OggS", 4) != 0) continue;
+        if (buf[i + 4] != 0) continue;              /* version == 0 */
+        if (buf[i + 5] & 0xF8) continue;            /* 保留位清零 */
         uint8_t segs = buf[i + 26];
         if (i + 27 + segs > n) continue;   /* segment table 越界，放弃此页 */
         uint64_t granule = (uint64_t)buf[i + 6] |
@@ -507,6 +519,9 @@ static void ogg_duration_from_tail(const uint8_t *buf, size_t n, TagInfo *out)
                            ((uint64_t)buf[i + 12] << 48) |
                            ((uint64_t)buf[i + 13] << 56);
         if (granule == 0) continue;        /* 首页 granule 为 0，跳过 */
+        /* 合理性下限：时长不超过 24 小时，防御误匹配产生的天文数字。 */
+        if (granule / (uint64_t)out->sample_rate > 24ULL * 3600ULL)
+            continue;
         out->duration = (double)granule / out->sample_rate;
         break;
     }
