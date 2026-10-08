@@ -63,11 +63,11 @@ REM                          (saves a section header + alignment padding)
 cl.exe /nologo /std:c11 /utf-8 /O1 /GS- /GL /Gy /Gw /MD /EHa- ^
     /DNDEBUG /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0600 ^
     /Fo:build\ /Fe:cplayer.exe ^
-    main.c win32_ui.c playlist.c audio_decode.c audio_waveout.c tag_reader.c ^
+    main.c win32_ui.c playlist.c audio_decode.c audio_waveout.c tag_reader.c tag_cache.c ^
     build\app.res ^
     /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /MERGE:.rdata=.text ^
     /MANIFEST:EMBED /MANIFESTINPUT:app.manifest ^
-    user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib winmm.lib
+    user32.lib gdi32.lib msimg32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib winmm.lib
 
 if errorlevel 1 ( echo FAILED: cl.exe & exit /b 1 )
 

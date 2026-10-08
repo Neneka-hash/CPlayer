@@ -29,6 +29,13 @@
 #define IDC_LBL_VOL     109
 #define IDC_LBL_STATUS  110
 
+/* Modern themed UI primitives (GDI, anti-aliased via off-screen DIB).
+ * All of these are internal to win32_ui.c but declared here so the design
+ * tokens are visible in one place. */
+#define UI_RADIUS_BTN   6       /* rounded corners for secondary buttons  */
+#define UI_RADIUS_PILL  15      /* fully-rounded pill buttons/status chip  */
+#define UI_RADIUS_CARD  10      /* playlist card corner radius             */
+
 /* Menu command ids. */
 #define IDM_FILE_ADD_FILES     2001
 #define IDM_FILE_ADD_FOLDER    2002
@@ -86,6 +93,10 @@ void ui_set_status(const wchar_t *fmt, ...);
 /* Format seconds as M:SS or H:MM:SS into buf (up to cap characters).
  * Negative values are treated as 0. */
 void ui_format_time(double seconds, wchar_t *buf, int cap);
+
+/* Force a full repaint of the custom-drawn chrome (buttons, list background,
+ * status chip). Call after a state change that alters colours. */
+void ui_repaint(void);
 
 /* Main window procedure. Handles all messages for the main window:
  * WM_CREATE, WM_COMMAND, WM_NOTIFY, WM_HSCROLL, WM_DROPFILES,

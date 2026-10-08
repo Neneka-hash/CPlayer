@@ -43,8 +43,9 @@ static void enable_dpi_awareness(void)
         PFN_SetProc p = (PFN_SetProc)GetProcAddress(shc, "SetProcessDpiAwareness");
         if (p) {
             /* PROCESS_PER_MONITOR_DPI_AWARE == 2 */
-            if (SUCCEEDED(p(2))) return;
+            if (SUCCEEDED(p(2))) { FreeLibrary(shc); return; }
         }
+        FreeLibrary(shc);
     }
     /* Legacy Vista fallback - loaded dynamically since not every downlevel
      * SDK header declares it. */
@@ -117,9 +118,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmd, int nSho
         wchar_t path[MAX_PATH];
         wcsncpy(path, lpCmd, MAX_PATH - 1);
         path[MAX_PATH - 1] = 0;
-        /* Strip surrounding quotes. */
+        /* Strip surrounding quotes.
+         * Source is path+1: it holds wcslen(path)-1 characters plus the
+         * terminating NUL, so copy wcslen(path) elements to move both the
+         * text and the NUL. Using wcslen(path) is correct here; copying
+         * fewer would leave the buffer unterminated, and the old code's
+         * length was off by one element (an out-of-bounds read). */
         if (path[0] == L'"') {
-            memmove(path, path + 1, (wcslen(path)) * sizeof(wchar_t));
+            memmove(path, path + 1, wcslen(path) * sizeof(wchar_t));
             wchar_t *q = wcschr(path, L'"');
             if (q) *q = 0;
         }

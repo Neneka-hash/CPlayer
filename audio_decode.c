@@ -125,6 +125,11 @@ static Decoder *decoder_open_mp3(const wchar_t *path)
      * pass over the file) so total duration and seeking are precise. The
      * file is still read in 128 KB chunks, never loaded whole. */
     if (mp3dec_ex_open_cb(ex, &d->mp3_io, MP3D_SEEK_TO_SAMPLE) != 0) {
+        /* minimp3_ex's open_cb returns early on error without releasing its
+         * own 128 KB I/O buffer or a partially built sample index, so the
+         * close call is what actually frees them. It is a no-op on the paths
+         * that failed before allocating, and it never touches our FILE*. */
+        mp3dec_ex_close(ex);
         free(ex); fclose(f); free(d);
         return NULL;
     }
@@ -335,8 +340,12 @@ int decoder_seek(Decoder *d, uint64_t frame)
         return drflac_seek_to_pcm_frame(d->flac, (drflac_uint64)frame);
     case FMT_WAV:
         return drwav_seek_to_pcm_frame(d->wav, (drwav_uint64)frame);
-    case FMT_OGG:
+    case FMT_OGG: {
+        /* stb_vorbis takes a 32-bit sample number: clamp rather than
+         * silently wrap for absurd (>4G frame) seeks. */
+        if (frame > 0xFFFFFFFFu) return 0;
         return stb_vorbis_seek(d->ogg, (unsigned int)frame);
+    }
     default:
         return 0;
     }
@@ -447,8 +456,20 @@ static void handle_open(void)
     LeaveCriticalSection(&g_player.cs);
 
     if (!path) {
+        /* Same housekeeping as the open-failure branch below: the previous
+         * decoder is already closed and the pipeline flushed here, so
+         * leaving state at PLAYING would strand the UI on "playing" with
+         * silence and no WM_TRACK_LOADED to refresh it. */
+        EnterCriticalSection(&g_player.cs);
+        g_player.state        = STATE_STOPPED;
+        g_player.cur_frame    = 0;
+        g_player.total_frames = 0;
+        g_player.eof          = 0;
+        g_player.ended_posted = 1;
+        LeaveCriticalSection(&g_player.cs);
         PostMessage(g_player.hMain, WM_PLAYER_ERROR,
                     (WPARAM)PLAYER_ERR_INVALID_INDEX, 0);
+        PostMessage(g_player.hMain, WM_TRACK_LOADED, 0, 0);
         return;
     }
     Decoder *d = decoder_open(path);
@@ -592,6 +613,10 @@ DWORD WINAPI decoder_thread_proc(LPVOID param)
 
         /* Drain any pending command first. */
         int cmd = (int)InterlockedExchange(&g_player.cmd, CMD_NONE);
+        /* Snapshot the seek target in the same critical section that
+         * consumes the command, so a CMD_SEEK always pairs with the frame
+         * value its sender published (a later seek cannot tear into it). */
+        uint64_t seek_at = (uint64_t)g_player.seek_frame;
         if (cmd == CMD_NONE) {
             /* No command: try to produce one block if we're playing.
              * This is the core streaming decode loop — repeatedly grab a free
@@ -638,7 +663,7 @@ DWORD WINAPI decoder_thread_proc(LPVOID param)
 
         switch (cmd) {
         case CMD_OPEN: handle_open(); break;
-        case CMD_SEEK: handle_seek((uint64_t)g_player.seek_frame); break;
+        case CMD_SEEK: handle_seek(seek_at); break;
         case CMD_STOP: handle_stop(); break;
         default: break;
         }

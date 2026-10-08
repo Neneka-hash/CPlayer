@@ -152,8 +152,24 @@ int waveout_open(int sample_rate)
 void waveout_close(void)
 {
     if (g_player.hwo) {
-        waveOutReset(g_player.hwo);
-        waveOutClose(g_player.hwo);
+        HWAVEOUT hwo = g_player.hwo;
+        /* Unprepare any still-prepared headers BEFORE Reset/Close: if
+         * shutdown lands while blocks are BS_PLAYING, waveOutClose would
+         * return WAVERR_STILLPLAYING and leak the driver handle. */
+        EnterCriticalSection(&g_player.cs);
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            PcmBlock *b = &g_player.blocks[i];
+            if ((b->state == BS_PLAYING || b->state == BS_FILLED) &&
+                (b->hdr.dwFlags & WHDR_PREPARED)) {
+                waveOutUnprepareHeader(hwo, &b->hdr, sizeof(WAVEHDR));
+                b->hdr.dwFlags &= ~WHDR_PREPARED;
+                b->state = BS_FREE;
+                b->frames = 0;
+            }
+        }
+        LeaveCriticalSection(&g_player.cs);
+        waveOutReset(hwo);
+        waveOutClose(hwo);
         g_player.hwo = NULL;
     }
 }
@@ -196,9 +212,10 @@ void player_open(int index)
     EnterCriticalSection(&g_player.cs);
     free(g_player.open_path);
     g_player.open_path = NULL;
-    if (index >= 0 && index < g_playlist.count &&
-        g_playlist.items[index].path) {
-        g_player.open_path = _wcsdup(g_playlist.items[index].path);
+    if (index >= 0 && index < g_playlist.count) {
+        /* Path text lives in the playlist's packed arena now; take a private
+         * copy while still on the UI thread (the only writer). */
+        g_player.open_path = playlist_dup_path(index);
     }
     g_player.open_index = index;
     InterlockedExchange(&g_player.cmd, CMD_OPEN);
@@ -249,7 +266,12 @@ void player_toggle_pause(void)
         g_player.state = STATE_PLAYING;
         if (g_player.hwo) waveOutRestart(g_player.hwo);
         SetEvent(g_player.dec_event);   /* 恢复解码 */
-        SetEvent(g_player.wo_ctrl);     /* 恢复提交 */
+        /* 恢复提交。flush 握手期间不碰 wo_ctrl：那段时间该事件归握手
+         * 专用（flush_start / flush_end 各消费一次），多一个信号只会让
+         * waveOut 在握手尾部多醒一次、重跑一遍无意义的 reset。握手结束
+         * 后 waveOut 回到主循环自然会看到 PLAYING 并继续提交。 */
+        if (!g_player.flushing)
+            SetEvent(g_player.wo_ctrl);
     }
     LeaveCriticalSection(&g_player.cs);
 }
@@ -301,15 +323,24 @@ int player_start_threads(void)
     g_player.dec_event  = CreateEvent(NULL, FALSE, FALSE, NULL);
     g_player.wo_idle_evt= CreateEvent(NULL, FALSE, FALSE, NULL);
     if (!g_player.wo_event || !g_player.wo_ctrl ||
-        !g_player.dec_event || !g_player.wo_idle_evt)
+        !g_player.dec_event || !g_player.wo_idle_evt) {
+        /* 失败时不能直接返回：临界区与已创建的事件必须回收，
+         * 否则调用方（main.c）走的是"只 pool_free 就退出"的分支。 */
+        player_shutdown();
         return 0;
+    }
 
     g_player.quit = 0;
     g_player.cmd  = CMD_NONE;
 
     g_player.dec_thread = CreateThread(NULL, 0, decoder_thread_proc, NULL, 0, NULL);
     g_player.wo_thread  = CreateThread(NULL, 0, waveout_thread_proc,  NULL, 0, NULL);
-    if (!g_player.dec_thread || !g_player.wo_thread) return 0;
+    if (!g_player.dec_thread || !g_player.wo_thread) {
+        /* 同上：线程可能已起来一个，必须 join 并释放全部资源。
+         * quit 会唤醒已启动的线程，让它自行退出。 */
+        player_shutdown();
+        return 0;
+    }
 
     return 1;
 }
@@ -322,6 +353,11 @@ int player_start_threads(void)
  */
 void player_shutdown(void)
 {
+    /* Idempotent: double shutdown (e.g. error paths in main) must not
+     * double-free handles or DeleteCriticalSection twice (UB). */
+    static volatile LONG done = 0;
+    if (InterlockedExchange(&done, 1) != 0)
+        return;
     /* 通知两个线程退出 */
     InterlockedExchange(&g_player.quit, 1);
     SetEvent(g_player.dec_event);

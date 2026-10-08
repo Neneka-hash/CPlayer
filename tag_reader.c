@@ -205,7 +205,10 @@ static void parse_id3v2(const uint8_t *buf, size_t buf_size, TagInfo *out) {
                        (size_t)(buf[9] & 0x7F);
     size_t pos = 10;
 
-    /* Skip extended header if present. */
+    /* Skip extended header if present.
+     * pos is clamped to buf_size afterwards: ext is attacker-controlled and
+     * an unbounded pos += ext could wrap size_t on a 32-bit build and let
+     * the frame loop read out of bounds. */
     if (flags & 0x40) {
         if (ver_major == 4) {
             if (buf_size < 14) return;
@@ -221,6 +224,7 @@ static void parse_id3v2(const uint8_t *buf, size_t buf_size, TagInfo *out) {
             size_t ext = rd_be32(buf + 10);
             pos += 4 + ext;
         }
+        if (pos > buf_size) return;   /* malformed / hostile header */
     }
 
     size_t end = 10 + tag_size;
@@ -243,7 +247,10 @@ static void parse_id3v2(const uint8_t *buf, size_t buf_size, TagInfo *out) {
             frame_size = rd_be32(buf + pos + 4);
         }
         size_t data_start = pos + 10;
-        if (data_start + frame_size > end) break;
+        /* Guard against size_t wraparound: data_start + frame_size can wrap
+         * on a 32-bit build when frame_size is near 0xFFFFFFFF, which would
+         * defeat this bound check and let decode_id3_text read out of bounds. */
+        if (frame_size > end - data_start) break;
 
         if (frame_size > 0) {
             if (memcmp(id, "TIT2", 4) == 0 && !out->title)
@@ -545,7 +552,9 @@ static void parse_wav(const uint8_t *buf, size_t buf_size, TagInfo *out) {
         memcpy(chunk_id, buf + pos, 4);
         uint32_t chunk_size = rd_le32(buf + pos + 4);
         size_t data_start = pos + 8;
-        if (data_start + chunk_size > buf_size) break;
+        /* Wrap-safe: on 32-bit builds data_start + chunk_size could overflow
+         * a size_t and slip past the bound check. */
+        if (chunk_size > buf_size - data_start) break;
 
         if (memcmp(chunk_id, "fmt ", 4) == 0 && chunk_size >= 16) {
             uint16_t chan      = rd_le16(buf + data_start + 2);
@@ -571,7 +580,7 @@ static void parse_wav(const uint8_t *buf, size_t buf_size, TagInfo *out) {
                 memcpy(sid, buf + sub_pos, 4);
                 uint32_t ssize = rd_le32(buf + sub_pos + 4);
                 size_t sdata = sub_pos + 8;
-                if (sdata + ssize > sub_end) break;
+                if (ssize > sub_end - sdata) break;   /* wrap-safe, as above */
                 if (ssize > 0) {
                     size_t slen = ssize;
                     while (slen > 0 && buf[sdata + slen - 1] == 0) slen--;

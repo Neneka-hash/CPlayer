@@ -52,6 +52,10 @@
 
 #define TIMER_ID_POSITION   1001
 #define TIMER_INTERVAL_MS   200
+/* Drives the chunked playlist import (folder drops / M3U loads run in
+ * bounded time slices on the UI thread so the window never freezes). */
+#define TIMER_ID_IMPORT     1002
+#define IMPORT_SLICE_MS     12
 
 /* ---- Player state machine -------------------------------------------- */
 /* Tracks whether the player is stopped, actively decoding+outputting, or
@@ -113,8 +117,10 @@ typedef struct Decoder Decoder;
                                             * switches. Kept as a fallback: if wParam is 0 the
                                             * UI treats lParam as a static string literal the
                                             * caller owns and must NOT free. */
-#define WM_TAGS_LOADED     (WM_USER + 4)   /* tag_reader thread: background tag read finished for one file:
-                                            * wParam = playlist index, lParam = TagInfo* (heap-allocated) */
+#define WM_TAGS_LOADED     (WM_USER + 4)   /* metadata worker: lazy tag load finished for one entry:
+                                            * wParam = playlist index, lParam = TagInfo* (heap-allocated).
+                                            * The UI installs it via playlist_install_meta and repaints
+                                            * the visible rows in a coalesced fashion. */
 
 /* Error codes for WM_PLAYER_ERROR (posted by decoder / waveOut threads). */
 #define PLAYER_ERR_INVALID_INDEX 1  /* 曲目索引无效（列表被清空/越界） */
@@ -192,9 +198,22 @@ typedef struct {
     HWND hList, hProgress, hVolume;      /* playlist listview, seekbar, volume slider */
     HWND hBtnPrev, hBtnPlay, hBtnStop, hBtnNext, hBtnMode;  /* transport buttons */
     HWND hLblTime, hLblVol, hLblStatus;  /* time display, volume label, status bar */
-    HFONT hFont;                   /* large font used for the status label   */
+    /* Owner-painted label text. The three labels above are stock statics
+     * that we repaint ourselves, but a stock static also draws its own text
+     * during WM_SETTEXT -- which would leave a ghost copy under ours. We
+     * therefore keep the strings here, keep the controls' own text empty,
+     * and paint from these buffers. */
+    wchar_t lbl_time[128];
+    wchar_t lbl_vol[64];
+    wchar_t lbl_status[256];
+    HFONT hFont;                   /* regular UI font                        */
+    HFONT hFontBold;               /* semibold, for the primary button       */
+    HFONT hFontSm;                 /* small, for secondary labels            */
+    HFONT hFontIcon;               /* Segoe MDL2 Assets, for glyph icons     */
+    int  hover_btn;                /* control id the mouse is over, 0 if none */
+    int  hover_row;                /* list row under the cursor, -1 if none  */
     int  seeking;                  /* 1 while the user drags the progress bar */
-    int  lang;                     /* LANG_ZH or LANG_EN */
+    int  lang;                     /* LANG_ZH / LANG_EN / LANG_ES / LANG_FR / LANG_JA */
 } Player;
 
 /* Single global instance. Defined in main.c. */
